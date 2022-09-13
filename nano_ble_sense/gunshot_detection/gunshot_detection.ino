@@ -39,24 +39,9 @@
  */
 
 /* Includes ---------------------------------------------------------------- */
-#include <WiFi.h>
-#include <ArduinoMqttClient.h>
 #include <PDM.h>
 #include <Gunshot_Detection_inferencing.h>
-
-#include "arduino_secrets.h"
-///////please enter your sensitive data in the Secret tab/arduino_secrets.h
-char ssid[] = SECRET_SSID;    // your network SSID (name)
-char pass[] = SECRET_PASS;    // your network password (use for WPA, or use as key for WEP)
-
-WiFiClient wifiClient;
-MqttClient mqttClient(wifiClient);
-
-const char broker[] = SECRET_BROKER;
-int        port     = SECRET_PORT;
-const char topic[]  = SECRET_TOPIC;
-const char user_name[] = SECRET_USER_NAME;
-const char password[] = SECRET_PASSWORD;
+#include <ArduinoBLE.h>
 
 /** Audio buffers, pointers and selectors */
 typedef struct {
@@ -69,50 +54,34 @@ typedef struct {
 static inference_t inference;
 static signed short sampleBuffer[2048];
 static bool debug_nn = false; // Set this to true to see e.g. features generated from the raw signal
-static volatile bool record_ready = false;
+
+/** BLE characterstics */
+const char* deviceServiceUuid = "19b10000-e8f2-537e-4f6c-d104768a1214";
+const char* deviceServiceCharacteristicUuid = "19b10001-e8f2-537e-4f6c-d104768a1214";
+const char* stringCharacteristicUuid = "1A3AC131-31EF-758B-BC51-54A61958EF82";
 
 /**
  * @brief      Arduino setup function
  */
 void setup()
 {
+    // Setup LEDs
+    pinMode(LEDR, OUTPUT);
+    pinMode(LEDG, OUTPUT);
+    pinMode(LEDB, OUTPUT);
+    
+    digitalWrite(LEDR, HIGH);   // will turn the LED off
+    digitalWrite(LEDG, HIGH);   // will turn the LED off
+    digitalWrite(LEDB, HIGH);   // will turn the LED off  
+  
     // put your setup code here, to run once:
     Serial.begin(115200);
 
-    // attempt to connect to WiFi network:
-    Serial.print("Attempting to connect to WPA SSID: ");
-    Serial.println(ssid);
-    while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
-      // failed, retry
-      Serial.print(".");
-      delay(3000);
-    }
-    Serial.println("Connected to the network");
-    Serial.println();
-
-    mqttClient.setId("Portenta_H7");
-
-    // You can provide a username and password for authentication
-    mqttClient.setUsernamePassword(user_name, password);
-  
-    Serial.print("Attempting to connect to the MQTT broker: ");
-    Serial.println(broker);
-  
-    if (!mqttClient.connect(broker, port)) {
-      Serial.print("MQTT connection failed! Error code = ");
-      Serial.println(mqttClient.connectError());
-  
-      while (1);
-    }
-
-    Serial.println("You're connected to the MQTT broker!");
-    Serial.println();
+    Serial.println("Edge Impulse Inferencing Demo");
 
     // summary of inferencing settings (from model_metadata.h)
     ei_printf("Inferencing settings:\n");
-    ei_printf("\tInterval: ");
-    ei_printf_float((float)EI_CLASSIFIER_INTERVAL_MS);
-    ei_printf(" ms.\n");
+    ei_printf("\tInterval: %.2f ms.\n", (float)EI_CLASSIFIER_INTERVAL_MS);
     ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
     ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
     ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
@@ -121,12 +90,75 @@ void setup()
         ei_printf("ERR: Failed to setup audio sampling\r\n");
         return;
     }
+
+    // Initialise BLE communication
+    if (!BLE.begin()) {
+      while (1) blinkLED(LEDR, 1);
+    }
+    
+    BLE.setLocalName("BLESense_Data_Collector"); 
+    BLE.advertise();
+  
+    blinkLED(LEDG, 3);  ///< Indicate that everything is fine
 }
 
 /**
  * @brief      Arduino main function. Runs the inferencing loop.
  */
 void loop()
+{
+    BLEDevice peripheral;
+    do
+    {
+      BLE.scanForUuid(deviceServiceUuid);
+      peripheral = BLE.available();
+    } while (!peripheral);
+  
+    if (peripheral) {
+      // discovered a peripheral, print out address, local name, and advertised service
+      Serial.println("Found " + peripheral.address() + " '" + peripheral.localName() + "' " + peripheral.advertisedServiceUuid());
+
+      BLE.stopScan();
+  
+      connectPeripheral(peripheral);
+      // peripheral disconnected, start scanning again
+    }
+}
+
+void connectPeripheral(BLEDevice peripheral)
+{
+    // connect to the peripheral
+    if (peripheral.connect()) {}
+    else { return; }
+  
+    // discover peripheral attributes
+    if (peripheral.discoverAttributes()) {}
+    else {
+      peripheral.disconnect();
+      return;
+    }
+  
+    // retrieve the characteristic
+    BLECharacteristic stringCharacteristic = peripheral.characteristic(stringCharacteristicUuid);
+  
+    if (!stringCharacteristic) {
+      peripheral.disconnect();
+      return;
+    } else if (!stringCharacteristic.canWrite()) {
+      peripheral.disconnect();
+      return;
+    }
+  
+    while (peripheral.connected()) {
+      if (perform_inference()) sendData(stringCharacteristic, true);
+      else sendData(stringCharacteristic, false);
+    }
+}
+
+/**
+ * @brief      This function performs interference.
+ */
+bool perform_inference()
 {
     ei_printf("Starting inferencing in 2 seconds...\n");
 
@@ -137,7 +169,7 @@ void loop()
     bool m = microphone_inference_record();
     if (!m) {
         ei_printf("ERR: Failed to record audio...\n");
-        return;
+        return false;
     }
 
     ei_printf("Recording done\n");
@@ -150,7 +182,7 @@ void loop()
     EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
     if (r != EI_IMPULSE_OK) {
         ei_printf("ERR: Failed to run classifier (%d)\n", r);
-        return;
+        return false;
     }
 
     // print the predictions
@@ -159,23 +191,19 @@ void loop()
         result.timing.dsp, result.timing.classification, result.timing.anomaly);
     ei_printf(": \n");
     for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-        ei_printf("    %s: ", result.classification[ix].label);
-        ei_printf_float(result.classification[ix].value);
-        ei_printf("\n");
+        ei_printf("    %s: %.5f\n", result.classification[ix].label, result.classification[ix].value);
     }
 #if EI_CLASSIFIER_HAS_ANOMALY == 1
-    ei_printf("    anomaly score: ");
-    ei_printf_float(result.anomaly);
-    ei_printf("\n");
+    ei_printf("    anomaly score: %.3f\n", result.anomaly);
 #endif
 
-    // Process the result and send report to the cloud
-    process_result(result);
+    bool outcome = process_result(result);
+    return outcome;
 }
 
 /**
  * @brief      PDM buffer full callback
- *             Copy audio data to app buffers
+ *             Get data and call audio thread callback
  */
 static void pdm_data_ready_inference_callback(void)
 {
@@ -184,7 +212,7 @@ static void pdm_data_ready_inference_callback(void)
     // read into the sample buffer
     int bytesRead = PDM.read((char *)&sampleBuffer[0], bytesAvailable);
 
-    if ((inference.buf_ready == 0) && (record_ready == true)) {
+    if (inference.buf_ready == 0) {
         for(int i = 0; i < bytesRead>>1; i++) {
             inference.buffer[inference.buf_count++] = sampleBuffer[i];
 
@@ -219,19 +247,20 @@ static bool microphone_inference_start(uint32_t n_samples)
     // configure the data receive callback
     PDM.onReceive(&pdm_data_ready_inference_callback);
 
-    // optionally set the gain, defaults to 24
-    // Note: values >=52 not supported
-    //PDM.setGain(40);
-
-    PDM.setBufferSize(2048);
+    PDM.setBufferSize(4096);
 
     // initialize PDM with:
     // - one channel (mono mode)
+    // - a 16 kHz sample rate
     if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {
-        ei_printf("ERR: Failed to start PDM!");
+        ei_printf("Failed to start PDM!");
         microphone_inference_end();
+
         return false;
     }
+
+    // set the gain, defaults to 20
+    PDM.setGain(127);
 
     return true;
 }
@@ -243,18 +272,14 @@ static bool microphone_inference_start(uint32_t n_samples)
  */
 static bool microphone_inference_record(void)
 {
-    bool ret = true;
+    inference.buf_ready = 0;
+    inference.buf_count = 0;
 
-
-    record_ready = true;
-    while (inference.buf_ready == 0) {
+    while(inference.buf_ready == 0) {
         delay(10);
     }
 
-    inference.buf_ready = 0;
-    record_ready = false;
-
-    return ret;
+    return true;
 }
 
 /**
@@ -273,22 +298,23 @@ static int microphone_audio_signal_get_data(size_t offset, size_t length, float 
 static void microphone_inference_end(void)
 {
     PDM.end();
-    ei_free(inference.buffer);
+    free(inference.buffer);
 }
 
 /**
  * @brief      Publish information to the mqtt cloud
  */
-static void process_result(ei_impulse_result_t& result)
+static bool process_result(ei_impulse_result_t& result)
 {
-    mqttClient.poll();
     const String label_to_look_for = "gunshot";
     int i = find_winner(result);
 
     if (result.classification[i].label == label_to_look_for)
     {
-        mqtt_publish(topic, label_to_look_for);
+        blinkLED(LEDG, 1);
+        return true;
     }
+    return false;
 }
 
 /**
@@ -312,14 +338,30 @@ static int find_winner(ei_impulse_result_t& result)
 }
 
 /**
- * @brief      Publish information to the mqtt cloud
+ * @brief      Send data via BLE
  */
-static void mqtt_publish(const String topic, const String msg)
+static void sendData(BLECharacteristic stringCharacteristic, bool result)
 {
-    // send message
-    mqttClient.beginMessage(topic);
-    mqttClient.print(msg);
-    mqttClient.endMessage();
+  static const String gunshot = "gunshot";
+  static const String other = "other";
+
+  // Write string to a BLE characterstic
+  if (result) stringCharacteristic.writeValue(gunshot.c_str());
+  else stringCharacteristic.writeValue(other.c_str());
+}
+
+/**
+ * @brief      Function to blink LED
+ */
+void blinkLED(int led_colour, int blink_count)
+{
+    for (int i = 0; i < blink_count; ++i)
+    {
+        digitalWrite(led_colour, LOW);
+        delay(150);
+        digitalWrite(led_colour, HIGH);
+        delay(150);
+    }
 }
 
 #if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_MICROPHONE
